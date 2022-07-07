@@ -3,16 +3,20 @@ package com.cloudbees.jenkins.plugins.amazonecs;
 import hudson.Extension;
 import hudson.model.Label;
 import hudson.model.LoadStatistics;
+import hudson.model.Queue;
 import hudson.model.queue.CauseOfBlockage;
+import hudson.model.queue.QueueListener;
 import hudson.slaves.Cloud;
 import hudson.slaves.CloudProvisioningListener;
 import hudson.slaves.NodeProvisioner;
 import jenkins.model.Jenkins;
+import jenkins.util.Timer;
 
 import javax.annotation.Nonnull;
 import java.util.Collection;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Overrides Jenkins' default ProvisioningStrategy to always provision an agent ASAP.
@@ -36,20 +40,19 @@ public class ECSProvisioningStrategy extends NodeProvisioner.Strategy {
         Label label = state.getLabel();
 
         int excessWorkload = snap.getQueueLength() - snap.getAvailableExecutors() - snap.getConnectingExecutors();
-
+        int startingExcessWorkload = excessWorkload;
+        Cloud.CloudState cloudState = new Cloud.CloudState(label, state.getAdditionalPlannedCapacity());
         CLOUD:
         for (Cloud c : Jenkins.get().clouds) {
             if (excessWorkload <= 0) {
                 break;  // enough agents allocated
             }
 
-            // Make sure this cloud actually can provision for this label.
-            if (!c.canProvision(label)) {
-                continue;
-            }
+            if (!(c instanceof ECSCloud)) continue;
+            if (!c.canProvision(cloudState)) continue;
 
             for (CloudProvisioningListener cl : CloudProvisioningListener.all()) {
-                CauseOfBlockage causeOfBlockage = cl.canProvision(c, label, excessWorkload);
+                CauseOfBlockage causeOfBlockage = cl.canProvision(c, cloudState, excessWorkload);
                 if (causeOfBlockage != null) {
                     continue CLOUD;
                 }
@@ -62,7 +65,7 @@ public class ECSProvisioningStrategy extends NodeProvisioner.Strategy {
                 }
             }
 
-            Collection<NodeProvisioner.PlannedNode> additionalCapacities = c.provision(label, excessWorkload);
+            Collection<NodeProvisioner.PlannedNode> additionalCapacities = c.provision(cloudState, excessWorkload);
 
             // compat with what the default NodeProvisioner.Strategy does
             fireOnStarted(c, label, additionalCapacities);
@@ -74,6 +77,11 @@ public class ECSProvisioningStrategy extends NodeProvisioner.Strategy {
                         new Object[]{ac.displayName, c.name, ac.numExecutors, excessWorkload});
             }
             state.recordPendingLaunches(additionalCapacities);
+        }
+        
+        if (startingExcessWorkload > excessWorkload){
+            LOGGER.log(Level.FINE, "Suggesting NodeProvisioner review");
+            Timer.get().schedule(label.nodeProvisioner::suggestReviewNow, 1L, TimeUnit.SECONDS);
         }
         // we took action, only pass on to other strategies if our action was insufficient
         return excessWorkload > 0 ? NodeProvisioner.StrategyDecision.CONSULT_REMAINING_STRATEGIES : NodeProvisioner.StrategyDecision.PROVISIONING_COMPLETED;
@@ -90,6 +98,27 @@ public class ECSProvisioningStrategy extends NodeProvisioner.Strategy {
                 LOGGER.log(Level.SEVERE, "Unexpected uncaught exception encountered while "
                         + "processing onStarted() listener call in " + cl + " for label "
                         + label.toString(), e);
+            }
+        }
+    }
+
+    /**
+     * Ping the nodeProvisioner as a new task enters the queue.
+     */
+    @Extension
+    public static class FastProvisioning extends QueueListener {
+
+        @Override
+        public void onEnterBuildable(Queue.BuildableItem item) {
+            final Jenkins jenkins = Jenkins.get();
+            final Label label = item.getAssignedLabel();
+            for (Cloud cloud : jenkins.clouds) {
+                if (cloud instanceof ECSCloud && cloud.canProvision(new Cloud.CloudState(label, 0))) {
+                    final NodeProvisioner provisioner = (label == null
+                            ? jenkins.unlabeledNodeProvisioner
+                            : label.nodeProvisioner);
+                    provisioner.suggestReviewNow();
+                }
             }
         }
     }
