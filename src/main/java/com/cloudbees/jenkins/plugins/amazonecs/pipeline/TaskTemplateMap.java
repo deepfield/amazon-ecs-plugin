@@ -53,12 +53,16 @@ public class TaskTemplateMap {
      * @param TaskTemplate The pod template to add.
      */
     public void addTemplate(@Nonnull ECSCloud cloud, @Nonnull ECSTaskTemplate TaskTemplate) {
-        List<ECSTaskTemplate> list = getOrCreateTemplateList(cloud);
-        list.add(TaskTemplate);
-        map.put(cloud.name, list);
+        synchronized (this.map) {
+            List<ECSTaskTemplate> list = getOrCreateTemplateList(cloud);
+            list.add(TaskTemplate);
+            map.put(cloud.name, list);
+        }
     }
 
     public void removeTemplate(@Nonnull ECSCloud cloud, @Nonnull ECSTaskTemplate TaskTemplate) {
-        getOrCreateTemplateList(cloud).remove(TaskTemplate);
+        synchronized (this.map) {
+            getOrCreateTemplateList(cloud).remove(TaskTemplate);
+        }
     }
 }
